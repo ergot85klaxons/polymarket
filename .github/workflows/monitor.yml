@@ -1,29 +1,23 @@
 name: polymarket-insider-monitor
-
 on:
   schedule:
     # ~каждые 10 минут, НЕ ровно на час (часы пик => задержки)
     - cron: '3,13,23,33,43,53 * * * *'
   workflow_dispatch: {}      # ручной запуск кнопкой в Actions
-
 # не запускать новый проход, пока предыдущий не закончил
 concurrency:
   group: pm-monitor
   cancel-in-progress: false
-
 jobs:
   monitor:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-
       - run: pip install -r requirements.txt
-
       # восстановить state.json из последнего кеша (last_alert + кеш кошельков)
       - name: Restore state
         uses: actions/cache/restore@v4
@@ -31,19 +25,21 @@ jobs:
           path: state.json
           key: pm-state-${{ github.run_id }}
           restore-keys: pm-state-
-
       - name: Run analyzer (one pass)
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
           RUN_ONCE: '1'
           BIN_SEC: '600'             # держим равным шагу cron (10 мин)
-          WATCH_TOP_EVENTS: '25'
-          WATCH_SLUGS: ${{ vars.WATCH_SLUGS }}   # опц.: задать в Settings > Variables
+          WATCH_TOP_EVENTS: '60'     # можно смело поднимать
+          MIN_MARKET_VOL24: '5000'   # отсекает мёртвые/копеечные рынки
+          REQUIRE_ORDERBOOK: '1'
+          MAX_MARKETS: '400'         # потолок-предохранитель
           ALERT_IFS: '6.0'
+          WATCH_SLUGS: ${{ vars.WATCH_SLUGS }}   # опц.: задать в Settings > Variables
+          # TEST_TELEGRAM: '1'       # раскомментируй для разовой проверки доставки
           # DRY_RUN: '1'             # раскомментируй для теста без отправки
         run: python polymarket_event_analyzer.py
-
       # сохранить обновлённый state.json (уникальный ключ на каждый run)
       - name: Save state
         if: always()
