@@ -37,6 +37,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 DRY_RUN            = os.getenv("DRY_RUN", "0") == "1"
 RUN_ONCE           = os.getenv("RUN_ONCE", "0") == "1"          # один проход для cron/Actions
+TEST_TELEGRAM      = os.getenv("TEST_TELEGRAM", "0") == "1"      # послать тестовый пинг и проверить доставку
 STATE_FILE         = os.getenv("STATE_FILE", "state.json")
 
 WATCH_SLUGS      = [s.strip() for s in os.getenv("WATCH_SLUGS", "").split(",") if s.strip()]
@@ -416,6 +417,12 @@ def main():
     state = load_state()
     log.info("Старт. RUN_ONCE=%s DRY_RUN=%s бин=%ss порог IFS=%.1f",
              RUN_ONCE, DRY_RUN, BIN_SEC, ALERT_IFS)
+
+    if TEST_TELEGRAM:
+        log.info("TEST_TELEGRAM=1 -> шлю тестовый пинг в Telegram")
+        send_telegram("✅ Тест связи: бот мониторинга Polymarket на связи. "
+                      "Если ты это видишь — доставка в Telegram работает.")
+
     pm.refresh()
 
     if RUN_ONCE:
