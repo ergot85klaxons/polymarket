@@ -330,11 +330,17 @@ def send_telegram(text):
     if DRY_RUN or not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
         log.info("[DRY_RUN/без токена]\n%s", text); return
     try:
-        SESSION.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                     json={"chat_id": TELEGRAM_CHAT_ID, "text": text,
-                           "parse_mode": "HTML", "disable_web_page_preview": False},
-                     timeout=15)
-    except requests.RequestException as e:
+        r = SESSION.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                         json={"chat_id": TELEGRAM_CHAT_ID, "text": text,
+                               "parse_mode": "HTML", "disable_web_page_preview": False},
+                         timeout=15)
+        data = r.json()
+        if not data.get("ok"):
+            log.error("Telegram отклонил отправку: %s %s",
+                      data.get("error_code"), data.get("description"))
+        else:
+            log.info("Telegram: сообщение отправлено")
+    except (requests.RequestException, ValueError) as e:
         log.error("Telegram error: %s", e)
 
 
