@@ -40,7 +40,7 @@ jobs:
           BIN_SEC: '600'             # держим равным шагу cron (10 мин)
           WATCH_TOP_EVENTS: '25'
           WATCH_SLUGS: ${{ vars.WATCH_SLUGS }}   # опц.: задать в Settings > Variables
-          ALERT_IFS: '6.0'
+          ALERT_IFS: '2.0'
           # DRY_RUN: '1'             # раскомментируй для теста без отправки
         run: python polymarket_event_analyzer.py
 
