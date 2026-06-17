@@ -58,6 +58,8 @@ FRESH_WALLET_MAX = int(os.getenv("FRESH_WALLET_MAX", "15"))
 ALERT_IFS      = float(os.getenv("ALERT_IFS", "6.0"))
 ALERT_COOLDOWN_S = int(os.getenv("ALERT_COOLDOWN_S", "3600"))
 MAX_FRESH_LOOKUPS = int(os.getenv("MAX_FRESH_LOOKUPS", "40"))   # лимит /activity-запросов на исход
+MAD_FLOOR_USD  = float(os.getenv("MAD_FLOOR_USD", "500"))       # пол "шума" в $: ниже него разброс не считаем нулевым
+Z_CAP          = float(os.getenv("Z_CAP", "10"))               # потолок z-score (защита от взрыва на тихих рынках)
 
 W_FRAG, W_COORD, W_PERSIST, W_FVP = 0.6, 0.8, 0.4, 0.3
 
@@ -87,12 +89,19 @@ def _get(url, params=None, retries=3, timeout=15):
     return None
 
 
-def modified_zscore(x, history):
+def modified_zscore(x, history, floor=0.0):
+    """Robust z: 0.6745*(x-median)/MAD. floor — минимальный масштаб шума,
+    чтобы при MAD≈0 (тихий рынок, одинаковые бины) не делить на ~0 и не получать
+    бесконечный z. Результат ограничен ±Z_CAP."""
     if len(history) < MIN_BASELINE:
         return 0.0
     med = statistics.median(history)
-    mad = statistics.median([abs(h - med) for h in history]) or 1e-9
-    return 0.6745 * (x - med) / mad
+    mad = statistics.median([abs(h - med) for h in history])
+    scale = max(mad, floor)
+    if scale <= 0:
+        return 0.0                     # нет ни разброса, ни пола => оценить нельзя
+    z = 0.6745 * (x - med) / scale
+    return max(min(z, Z_CAP), -Z_CAP)
 
 
 # --------------------------------------------------------------------------- #
@@ -257,7 +266,7 @@ class EventAnalyzer:
         if abs(net) < MIN_NET_USD:
             return None
         directionality = cur.directionality
-        z = modified_zscore(abs(net), [abs(b.net) for b in hist])
+        z = modified_zscore(abs(net), [abs(b.net) for b in hist], floor=MAD_FLOOR_USD)
 
         # --- ГЕЙТ: дальше считаем тяжёлые метрики только если базовый сигнал есть ---
         if directionality < DIR_MIN or z < Z_MIN:
@@ -269,7 +278,7 @@ class EventAnalyzer:
         hist_msize = [b.mean_size for b in hist if b.count]
         frag = 0.0
         if hist_counts and hist_msize:
-            count_z = modified_zscore(cur.count, hist_counts)
+            count_z = modified_zscore(cur.count, hist_counts, floor=2.0)
             if count_z >= 2.0 and cur.mean_size < 0.6 * statistics.median(hist_msize):
                 frag = min(count_z / 2.0, 2.0)
 
