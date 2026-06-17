@@ -70,6 +70,9 @@ ALERT_COOLDOWN_S = int(os.getenv("ALERT_COOLDOWN_S", "3600"))
 MAX_FRESH_LOOKUPS = int(os.getenv("MAX_FRESH_LOOKUPS", "40"))   # лимит /activity-запросов на исход
 MAD_FLOOR_USD  = float(os.getenv("MAD_FLOOR_USD", "500"))       # пол "шума" в $: ниже него разброс не считаем нулевым
 Z_CAP          = float(os.getenv("Z_CAP", "10"))               # потолок z-score (защита от взрыва на тихих рынках)
+PRICE_MIN      = float(os.getenv("PRICE_MIN", "0.02"))         # ниже = пыль/лотерейный шум, игнор
+PRICE_MAX      = float(os.getenv("PRICE_MAX", "0.90"))         # выше = "мёртвая определённость", не инсайд
+W_LONGSHOT     = float(os.getenv("W_LONGSHOT", "1.5"))         # вес бонуса за дешевизну исхода
 
 W_FRAG, W_COORD, W_PERSIST, W_FVP = 0.6, 0.8, 0.4, 0.3
 
@@ -336,6 +339,12 @@ class EventAnalyzer:
         net = cur.net
         if abs(net) < MIN_NET_USD:
             return None
+
+        # цена входа (объёмно-взвешенная) — инсайд интересен только в "живом" окне цен
+        avg_price = (cur.gross / cur.sum_size) if cur.sum_size else 0.0
+        if not (PRICE_MIN <= avg_price <= PRICE_MAX):
+            return None     # мёртвая определённость (>90¢) или пыль (<2¢) — не инсайд
+
         directionality = cur.directionality
         z = modified_zscore(abs(net), [abs(b.net) for b in hist], floor=MAD_FLOOR_USD)
 
@@ -343,6 +352,11 @@ class EventAnalyzer:
         if directionality < DIR_MIN or z < Z_MIN:
             return None
         base = z * directionality
+
+        # longshot-бонус: чем дешевле исход в окне, тем сильнее асимметрия знания.
+        # 0 у верхнего края окна (PRICE_MAX), ~1 у нижнего (PRICE_MIN).
+        longshot = (PRICE_MAX - avg_price) / (PRICE_MAX - PRICE_MIN)
+        longshot = max(0.0, min(longshot, 1.0))
 
         # (4) fragmentation
         hist_counts = [b.count for b in hist]
@@ -385,13 +399,16 @@ class EventAnalyzer:
             elif abs(dp) < 0.005:
                 fvp, fvp_label = 0.7, "стелс-накопление (цена ещё не двинулась)"
 
-        ifs = base * (1 + W_FRAG * frag + W_COORD * coord
+        ifs = base * (1 + W_LONGSHOT * longshot + W_FRAG * frag + W_COORD * coord
                       + W_PERSIST * persist_norm + W_FVP * fvp)
 
         return {"ifs": ifs, "net": net, "directionality": directionality, "z": z,
                 "frag": frag, "coord": coord, "n_fresh": n_fresh, "persist": persist,
                 "fvp_label": fvp_label, "n_wallets": len(cur.wallet_net),
-                "count": cur.count, "asset": asset}
+                "count": cur.count, "asset": asset, "longshot": longshot,
+                "avg_price": avg_price,
+                "first_price": cur.first_price or 0.0,
+                "last_price": cur.last_price or 0.0}
 
 
 # --------------------------------------------------------------------------- #
@@ -421,12 +438,26 @@ def build_alert(market, res):
     outcome = esc(market["tokens"].get(res["asset"], res["asset"][:10] + "…"))
     side = "накопление" if res["net"] > 0 else "сброс"
     slug = market.get("event_slug") or ""
+
+    # коэффициент: цена = вероятность исхода; десятичный кэф = 1/цена
+    avg = res.get("avg_price") or 0.0
+    fp, lp = res.get("first_price") or 0.0, res.get("last_price") or 0.0
+    if avg > 0:
+        odds = 1 / avg
+        price_line = (f"коэффициент: <b>{avg*100:.1f}¢</b> (≈{avg*100:.0f}% вер., кэф {odds:.2f}×)"
+                      f", бин {fp*100:.0f}→{lp*100:.0f}¢")
+    else:
+        price_line = "коэффициент: н/д"
+
     reasons = [
         f"чистый поток: <b>${res['net']:+,.0f}</b> ({side})",
+        price_line,
         f"однонаправленность: {res['directionality']*100:.0f}%",
         f"аномальность z={res['z']:.1f}",
         f"кошельков в бине: {res['n_wallets']}, сделок: {res['count']}",
     ]
+    if res.get("longshot", 0) >= 0.6:
+        reasons.append("⚠️ ЛОНГШОТ: крупный поток в дешёвый исход (высокая асимметрия)")
     if res["frag"] > 0:
         reasons.append("⚠️ подпись ДРОБЛЕНИЯ (много мелких сделок)")
     if res["coord"] > 0.3:
