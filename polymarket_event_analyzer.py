@@ -46,6 +46,15 @@ POLL_INTERVAL_S  = int(os.getenv("POLL_INTERVAL_S", "45"))
 DISCOVERY_REFRESH_S = int(os.getenv("DISCOVERY_REFRESH_S", "1800"))
 TRADES_LIMIT     = int(os.getenv("TRADES_LIMIT", "1000"))       # сколько сделок тянуть на рынок
 
+# Фильтр мусорных рынков и потолок ------------------------------------------ #
+MIN_MARKET_VOL24 = float(os.getenv("MIN_MARKET_VOL24", "5000"))  # мин. суточный объём рынка, $
+REQUIRE_ORDERBOOK = os.getenv("REQUIRE_ORDERBOOK", "1") == "1"   # только рынки с активным ордербуком
+MAX_MARKETS      = int(os.getenv("MAX_MARKETS", "400"))          # жёсткий потолок числа рынков (0 = без лимита)
+
+# Адаптивный темп запросов -------------------------------------------------- #
+REQ_INTERVAL_MIN = float(os.getenv("REQ_INTERVAL_MIN", "0.15"))  # базовая пауза между запросами, сек
+REQ_INTERVAL_MAX = float(os.getenv("REQ_INTERVAL_MAX", "3.0"))   # макс. пауза при троттлинге
+
 # Бины и горизонт ----------------------------------------------------------- #
 BIN_SEC        = int(os.getenv("BIN_SEC", "600"))    # размер бина (10 мин = шаг cron)
 HORIZON_BINS   = int(os.getenv("HORIZON_BINS", "24"))
@@ -76,13 +85,40 @@ SESSION = requests.Session()
 SESSION.headers.update({"Accept": "application/json", "User-Agent": "pm-event-analyzer/1.1"})
 
 
+class Pacer:
+    """Глобальный темп запросов: замедляется при 429, плавно разгоняется обратно."""
+    def __init__(self, base, mx):
+        self.base = self.interval = base
+        self.max = mx
+        self.last = 0.0
+
+    def wait(self):
+        delta = time.monotonic() - self.last
+        if delta < self.interval:
+            time.sleep(self.interval - delta)
+        self.last = time.monotonic()
+
+    def throttled(self):
+        self.interval = min(self.interval * 2, self.max)
+        log.warning("Троттлинг: пауза между запросами повышена до %.2fs", self.interval)
+
+    def ok(self):
+        self.interval = max(self.base, self.interval * 0.9)
+
+
+PACER = Pacer(REQ_INTERVAL_MIN, REQ_INTERVAL_MAX)
+
+
 def _get(url, params=None, retries=3, timeout=15):
     for attempt in range(retries):
+        PACER.wait()
         try:
             r = SESSION.get(url, params=params, timeout=timeout)
             if r.status_code == 429:
+                PACER.throttled()
                 time.sleep(2 ** attempt); continue
             r.raise_for_status()
+            PACER.ok()
             return r.json()
         except requests.RequestException as e:
             log.warning("HTTP (%s/%s): %s", attempt + 1, retries, e)
@@ -140,35 +176,69 @@ class Polymarket:
         self.markets = {}
         self._last_discovery = 0.0
 
-    def _ingest_event(self, ev):
+    def _ingest_event(self, ev, forced=False):
+        """forced=True (рынки из WATCH_SLUGS) — добавляем без фильтра по объёму."""
         ev_slug = ev.get("slug")
         title_ev = ev.get("title") or ev_slug
         for m in ev.get("markets", []):
             cid = m.get("conditionId")
             if not cid:
                 continue
+
+            # --- фильтр мусора (кроме явно запрошенных через WATCH_SLUGS) ---
+            vol24 = float(m.get("volume24hr") or m.get("volumeNum") or 0)
+            if not forced:
+                if m.get("closed") or m.get("active") is False:
+                    continue
+                if REQUIRE_ORDERBOOK and not m.get("enableOrderBook", True):
+                    continue
+                if vol24 < MIN_MARKET_VOL24:
+                    continue
+
+            # --- названия исходов: поддержка двух форматов Gamma ---
             tokens = {}
-            for t in (m.get("tokens") or []):
-                if t.get("token_id"):
-                    tokens[str(t["token_id"])] = t.get("outcome", "?")
+            toks = m.get("tokens")
+            if isinstance(toks, list) and toks:
+                for t in toks:
+                    if t.get("token_id"):
+                        tokens[str(t["token_id"])] = t.get("outcome", "?")
+            else:
+                ids, outs = m.get("clobTokenIds"), m.get("outcomes")
+                try:
+                    ids = json.loads(ids) if isinstance(ids, str) else (ids or [])
+                    outs = json.loads(outs) if isinstance(outs, str) else (outs or [])
+                except (ValueError, TypeError):
+                    ids, outs = [], []
+                for i, tid in enumerate(ids):
+                    tokens[str(tid)] = outs[i] if i < len(outs) else "?"
+
             self.markets[cid] = {
                 "title": m.get("question") or title_ev,
                 "event_slug": ev_slug,
                 "tokens": tokens,
+                "vol24": vol24,
             }
 
     def refresh(self):
+        self.markets = {}
         for slug in WATCH_SLUGS:
             for ev in (_get(f"{GAMMA}/events", params={"slug": slug}) or []):
-                self._ingest_event(ev)
+                self._ingest_event(ev, forced=True)
         for ev in (_get(f"{GAMMA}/events", params={
             "active": "true", "closed": "false",
             "order": "volume_24hr", "ascending": "false",
             "limit": WATCH_TOP_EVENTS,
         }) or []):
             self._ingest_event(ev)
+
+        # потолок: при превышении оставляем самые объёмные рынки
+        if MAX_MARKETS and len(self.markets) > MAX_MARKETS:
+            top = sorted(self.markets.items(), key=lambda kv: -kv[1]["vol24"])[:MAX_MARKETS]
+            self.markets = dict(top)
+
         self._last_discovery = time.time()
-        log.info("Watchlist: %s рынков", len(self.markets))
+        log.info("Watchlist: %s рынков (фильтр: vol24h>=$%.0f, ордербук=%s)",
+                 len(self.markets), MIN_MARKET_VOL24, REQUIRE_ORDERBOOK)
 
     def maybe_refresh(self):
         if time.time() - self._last_discovery > DISCOVERY_REFRESH_S:
@@ -396,7 +466,7 @@ def run_cycle(pm, an, state, seen):
             asset = str(t.get("asset") or "")
             if asset:
                 touched.add((cid, asset))
-        time.sleep(0.2)   # бережём rate limit
+        # темп запросов держит глобальный PACER внутри _get
 
     now = time.time()
     for (cid, asset) in touched:
