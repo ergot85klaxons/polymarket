@@ -71,7 +71,8 @@ MAX_FRESH_LOOKUPS = int(os.getenv("MAX_FRESH_LOOKUPS", "40"))   # лимит /ac
 MAD_FLOOR_USD  = float(os.getenv("MAD_FLOOR_USD", "500"))       # пол "шума" в $: ниже него разброс не считаем нулевым
 Z_CAP          = float(os.getenv("Z_CAP", "10"))               # потолок z-score (защита от взрыва на тихих рынках)
 PRICE_MIN      = float(os.getenv("PRICE_MIN", "0.02"))         # ниже = пыль/лотерейный шум, игнор
-PRICE_MAX      = float(os.getenv("PRICE_MAX", "0.90"))         # выше = "мёртвая определённость", не инсайд
+PRICE_MAX      = float(os.getenv("PRICE_MAX", "0.70"))         # выше = слишком дорого, апсайд мал — не инсайд
+ACCUMULATION_ONLY = os.getenv("ACCUMULATION_ONLY", "1") == "1"  # считать только набор позиции (net>0), отток игнор
 W_LONGSHOT     = float(os.getenv("W_LONGSHOT", "1.5"))         # вес бонуса за дешевизну исхода
 MIN_VOL_SHARE  = float(os.getenv("MIN_VOL_SHARE", "0.01"))     # мин. доля нетто-потока в суточном объёме рынка (1%)
 W_VOLSHARE     = float(os.getenv("W_VOLSHARE", "0.5"))         # вес множителя за долю в объёме
@@ -400,6 +401,8 @@ class EventAnalyzer:
         net = cur.net
         if abs(net) < MIN_NET_USD:
             return None
+        if ACCUMULATION_ONLY and net <= 0:
+            return None     # отток/сброс — чаще хедж или ребаланс, не инсайд
 
         # доля нетто-потока в суточном объёме рынка — "мелкий поток в большом волюме" отсекаем
         vol24 = float((pm.markets.get(cid) or {}).get("vol24", 0) or 0)
