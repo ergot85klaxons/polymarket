@@ -73,8 +73,15 @@ Z_CAP          = float(os.getenv("Z_CAP", "10"))               # потолок 
 PRICE_MIN      = float(os.getenv("PRICE_MIN", "0.02"))         # ниже = пыль/лотерейный шум, игнор
 PRICE_MAX      = float(os.getenv("PRICE_MAX", "0.90"))         # выше = "мёртвая определённость", не инсайд
 W_LONGSHOT     = float(os.getenv("W_LONGSHOT", "1.5"))         # вес бонуса за дешевизну исхода
+MIN_VOL_SHARE  = float(os.getenv("MIN_VOL_SHARE", "0.01"))     # мин. доля нетто-потока в суточном объёме рынка (1%)
+W_VOLSHARE     = float(os.getenv("W_VOLSHARE", "0.5"))         # вес множителя за долю в объёме
+WINDOW_BINS    = int(os.getenv("WINDOW_BINS", "3"))            # сколько бинов = "текущее окно" накопления (3*BIN_SEC)
+MIN_SURGE      = float(os.getenv("MIN_SURGE", "2.0"))          # мин. всплеск объёма окна над его нормой (×)
+W_SURGE        = float(os.getenv("W_SURGE", "0.6"))            # вес множителя за всплеск объёма
 
 W_FRAG, W_COORD, W_PERSIST, W_FVP = 0.6, 0.8, 0.4, 0.3
+W_CONC            = float(os.getenv("W_CONC", "1.2"))          # вес концентрации притока в один исход события
+MIN_EVENT_MARKETS = int(os.getenv("MIN_EVENT_MARKETS", "3"))   # с какого числа кандидатов события считать концентрацию
 
 GAMMA = "https://gamma-api.polymarket.com"
 DATA  = "https://data-api.polymarket.com"
@@ -303,6 +310,23 @@ class Bin:
     def mean_size(self):
         return self.sum_size / self.count if self.count else 0.0
 
+    @staticmethod
+    def merge(bins):
+        """Сливает список бинов в один агрегат-окно (по возрастанию времени)."""
+        w = Bin()
+        for b in bins:
+            w.net += b.net
+            w.gross += b.gross
+            w.count += b.count
+            w.sum_size += b.sum_size
+            for k, v in b.wallet_net.items():
+                w.wallet_net[k] += v
+            if b.first_ts is not None and (w.first_ts is None or b.first_ts < w.first_ts):
+                w.first_ts, w.first_price = b.first_ts, b.first_price
+            if b.last_ts is not None and (w.last_ts is None or b.last_ts >= w.last_ts):
+                w.last_ts, w.last_price = b.last_ts, b.last_price
+        return w
+
 
 # --------------------------------------------------------------------------- #
 #  Анализатор
@@ -310,6 +334,41 @@ class Bin:
 class EventAnalyzer:
     def __init__(self):
         self.bins = defaultdict(OrderedDict)   # (cid, asset) -> {bin_idx: Bin}
+        self._win_cache = {}                   # (cid,asset) -> window net, сбрасывается каждый цикл
+
+    def reset_cycle_cache(self):
+        self._win_cache = {}
+
+    def window_net(self, cid, asset):
+        """Нетто-поток текущего окна (последние WINDOW_BINS бинов) с кешем на цикл."""
+        key = (cid, asset)
+        if key in self._win_cache:
+            return self._win_cache[key]
+        series = self.bins.get(key)
+        val = 0.0
+        if series and len(series) >= WINDOW_BINS:
+            idxs = sorted(series.keys())
+            val = Bin.merge([series[i] for i in idxs[-WINDOW_BINS:]]).net
+        self._win_cache[key] = val
+        return val
+
+    def event_concentration(self, cid, asset, pm, target_net):
+        """Доля притока окна, приходящаяся на целевой исход, среди всех исходов события.
+        Возвращает (concentration 0..1, число рынков-кандидатов события с потоком)."""
+        ev = (pm.markets.get(cid) or {}).get("event_slug")
+        if not ev:
+            return 0.0, 0
+        total = 0.0
+        markets = set()
+        for (cid2, asset2) in list(self.bins.keys()):
+            if (pm.markets.get(cid2) or {}).get("event_slug") != ev:
+                continue
+            wn = abs(self.window_net(cid2, asset2))
+            if wn > 0:
+                total += wn
+                markets.add(cid2)
+        conc = (abs(target_net) / total) if total > 0 else 0.0
+        return conc, len(markets)
 
     def ingest(self, cid, trade):
         asset = str(trade.get("asset") or "")
@@ -330,55 +389,72 @@ class EventAnalyzer:
 
     def analyze(self, cid, asset, pm, wallet_cache):
         series = self.bins.get((cid, asset))
-        if not series or len(series) < MIN_BASELINE + 1:
+        # нужно достаточно бинов, чтобы по базлайну набралось >= MIN_BASELINE скользящих окон
+        if not series or len(series) < MIN_BASELINE + 2 * WINDOW_BINS - 1:
             return None
         idxs = sorted(series.keys())
-        cur = series[idxs[-1]]
-        hist = [series[i] for i in idxs[:-1]]
+        cur_bins = [series[i] for i in idxs[-WINDOW_BINS:]]      # текущее окно накопления
+        base_bins = [series[i] for i in idxs[:-WINDOW_BINS]]     # история до окна
+        cur = Bin.merge(cur_bins)                               # агрегат окна
 
         net = cur.net
         if abs(net) < MIN_NET_USD:
             return None
 
+        # доля нетто-потока в суточном объёме рынка — "мелкий поток в большом волюме" отсекаем
+        vol24 = float((pm.markets.get(cid) or {}).get("vol24", 0) or 0)
+        vol_share = (abs(net) / vol24) if vol24 > 0 else 0.0
+        if vol24 > 0 and vol_share < MIN_VOL_SHARE:
+            return None
+
         # цена входа (объёмно-взвешенная) — инсайд интересен только в "живом" окне цен
         avg_price = (cur.gross / cur.sum_size) if cur.sum_size else 0.0
         if not (PRICE_MIN <= avg_price <= PRICE_MAX):
-            return None     # мёртвая определённость (>90¢) или пыль (<2¢) — не инсайд
+            return None
+
+        # % прироста к объёму: объём окна против его же нормы (медиана по базлайну × длину окна)
+        base_gross_per_bin = statistics.median([b.gross for b in base_bins]) if base_bins else 0.0
+        expected_window_gross = base_gross_per_bin * WINDOW_BINS
+        surge = (cur.gross / expected_window_gross) if expected_window_gross > 0 else (
+            999.0 if cur.gross > 0 else 0.0)   # объём из ниоткуда на мёртвом рынке = большой всплеск
+        if surge < MIN_SURGE:
+            return None     # объём не подскочил относительно нормы — не накопление
 
         directionality = cur.directionality
-        z = modified_zscore(abs(net), [abs(b.net) for b in hist], floor=MAD_FLOOR_USD)
 
-        # --- ГЕЙТ: дальше считаем тяжёлые метрики только если базовый сигнал есть ---
+        # z-score: окно против предыдущих окон такого же размера (скользящих, для статистики)
+        base_window_nets = [abs(Bin.merge(base_bins[i:i + WINDOW_BINS]).net)
+                            for i in range(len(base_bins) - WINDOW_BINS + 1)]
+        z = modified_zscore(abs(net), base_window_nets, floor=MAD_FLOOR_USD)
+
+        # --- ГЕЙТ ---
         if directionality < DIR_MIN or z < Z_MIN:
             return None
         base = z * directionality
 
-        # longshot-бонус: чем дешевле исход в окне, тем сильнее асимметрия знания.
-        # 0 у верхнего края окна (PRICE_MAX), ~1 у нижнего (PRICE_MIN).
-        longshot = (PRICE_MAX - avg_price) / (PRICE_MAX - PRICE_MIN)
-        longshot = max(0.0, min(longshot, 1.0))
+        # longshot-бонус: чем дешевле исход, тем сильнее асимметрия знания
+        longshot = max(0.0, min((PRICE_MAX - avg_price) / (PRICE_MAX - PRICE_MIN), 1.0))
 
-        # (4) fragmentation
-        hist_counts = [b.count for b in hist]
-        hist_msize = [b.mean_size for b in hist if b.count]
+        # fragmentation: число сделок окна против нормы по бинам
+        hist_counts = [b.count for b in base_bins]
+        hist_msize = [b.mean_size for b in base_bins if b.count]
         frag = 0.0
         if hist_counts and hist_msize:
-            count_z = modified_zscore(cur.count, hist_counts, floor=2.0)
+            count_z = modified_zscore(cur.count / WINDOW_BINS, hist_counts, floor=2.0)
             if count_z >= 2.0 and cur.mean_size < 0.6 * statistics.median(hist_msize):
                 frag = min(count_z / 2.0, 2.0)
 
-        # (5) coordination — freshness ТОЛЬКО для кошельков текущего бина (ленивый /activity)
+        # coordination — свежесть кошельков всего окна (ленивый /activity)
         sign = 1 if net > 0 else -1
         contributors = sorted(cur.wallet_net.items(), key=lambda kv: -abs(kv[1]))[:MAX_FRESH_LOOKUPS]
-        fresh_same_dir = 0.0
-        n_fresh = 0
+        fresh_same_dir, n_fresh = 0.0, 0
         for w, wnet in contributors:
             if (1 if wnet > 0 else -1) == sign and pm.is_fresh(w, wallet_cache):
                 fresh_same_dir += abs(wnet)
                 n_fresh += 1
         coord = min(fresh_same_dir / abs(net), 1.0) if net else 0.0
 
-        # (6) persistence
+        # persistence — сколько бинов подряд (внутри и до окна) держат знак нетто
         persist = 0
         for i in reversed(idxs):
             b = series[i]
@@ -390,7 +466,7 @@ class EventAnalyzer:
                 break
         persist_norm = min(persist / 4.0, 2.0)
 
-        # (7) flow-vs-price
+        # flow-vs-price по всему окну
         fvp, fvp_label = 0.0, ""
         if cur.first_price and cur.last_price:
             dp = cur.last_price - cur.first_price
@@ -399,13 +475,24 @@ class EventAnalyzer:
             elif abs(dp) < 0.005:
                 fvp, fvp_label = 0.7, "стелс-накопление (цена ещё не двинулась)"
 
-        ifs = base * (1 + W_LONGSHOT * longshot + W_FRAG * frag + W_COORD * coord
+        volshare_norm = min(vol_share / MIN_VOL_SHARE, 3.0) if vol_share else 0.0
+        surge_norm = min(surge / MIN_SURGE, 3.0)
+
+        # концентрация: какую долю притока ВСЕГО события забирает этот исход
+        conc, n_ev_markets = self.event_concentration(cid, asset, pm, net)
+        conc_factor = conc if n_ev_markets >= MIN_EVENT_MARKETS else 0.0
+
+        ifs = base * (1 + W_LONGSHOT * longshot + W_VOLSHARE * volshare_norm
+                      + W_SURGE * surge_norm + W_CONC * conc_factor
+                      + W_FRAG * frag + W_COORD * coord
                       + W_PERSIST * persist_norm + W_FVP * fvp)
 
         return {"ifs": ifs, "net": net, "directionality": directionality, "z": z,
                 "frag": frag, "coord": coord, "n_fresh": n_fresh, "persist": persist,
                 "fvp_label": fvp_label, "n_wallets": len(cur.wallet_net),
                 "count": cur.count, "asset": asset, "longshot": longshot,
+                "vol_share": vol_share, "vol24": vol24, "surge": surge,
+                "conc": conc, "n_ev_markets": n_ev_markets,
                 "avg_price": avg_price,
                 "first_price": cur.first_price or 0.0,
                 "last_price": cur.last_price or 0.0}
@@ -451,11 +538,16 @@ def build_alert(market, res):
 
     reasons = [
         f"чистый поток: <b>${res['net']:+,.0f}</b> ({side})",
+        f"доля в объёме рынка: <b>{res.get('vol_share',0)*100:.1f}%</b> (vol24h ${res.get('vol24',0):,.0f})",
+        f"всплеск объёма: <b>{res.get('surge',0):.1f}×</b> над нормой (окно {WINDOW_BINS*BIN_SEC//60} мин)",
         price_line,
         f"однонаправленность: {res['directionality']*100:.0f}%",
         f"аномальность z={res['z']:.1f}",
         f"кошельков в бине: {res['n_wallets']}, сделок: {res['count']}",
     ]
+    if res.get("n_ev_markets", 0) >= MIN_EVENT_MARKETS and res.get("conc", 0) >= 0.5:
+        reasons.append(f"⚠️ КОНЦЕНТРАЦИЯ В СОБЫТИИ: {res['conc']*100:.0f}% всего притока "
+                       f"события (из {res['n_ev_markets']} кандидатов) — в этот исход")
     if res.get("longshot", 0) >= 0.6:
         reasons.append("⚠️ ЛОНГШОТ: крупный поток в дешёвый исход (высокая асимметрия)")
     if res["frag"] > 0:
@@ -500,6 +592,7 @@ def run_cycle(pm, an, state, seen):
         # темп запросов держит глобальный PACER внутри _get
 
     now = time.time()
+    an.reset_cycle_cache()   # окно-кеш строится заново на свежих данных цикла
     for (cid, asset) in touched:
         res = an.analyze(cid, asset, pm, wallet_cache)
         if not res or res["ifs"] < ALERT_IFS:
