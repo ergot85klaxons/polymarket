@@ -8,6 +8,8 @@ on:
 concurrency:
   group: pm-monitor
   cancel-in-progress: false
+permissions:
+  contents: write            # нужно для keepalive-коммита
 jobs:
   monitor:
     runs-on: ubuntu-latest
@@ -31,14 +33,15 @@ jobs:
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
           RUN_ONCE: '1'
           BIN_SEC: '600'             # держим равным шагу cron (10 мин)
-          WATCH_TOP_EVENTS: '60'     # можно смело поднимать
-          MIN_MARKET_VOL24: '5000'   # отсекает мёртвые/копеечные рынки
+          WATCH_TOP_EVENTS: '60'
+          MIN_MARKET_VOL24: '5000'
           REQUIRE_ORDERBOOK: '1'
-          MAX_MARKETS: '400'         # потолок-предохранитель
-          ALERT_IFS: '6.0'
-          WATCH_SLUGS: ${{ vars.WATCH_SLUGS }}   # опц.: задать в Settings > Variables
-          # TEST_TELEGRAM: '1'       # раскомментируй для разовой проверки доставки
-          # DRY_RUN: '1'             # раскомментируй для теста без отправки
+          MAX_MARKETS: '400'
+          ALERT_IFS: '25'            # планка поднята: только сильные сигналы
+          PRICE_MAX: '0.70'          # фокус на лонгшотах
+          WATCH_SLUGS: ${{ vars.WATCH_SLUGS }}
+          # TEST_TELEGRAM: '1'       # разовая проверка доставки
+          # DRY_RUN: '1'             # тест без отправки
         run: python polymarket_event_analyzer.py
       # сохранить обновлённый state.json (уникальный ключ на каждый run)
       - name: Save state
@@ -47,3 +50,15 @@ jobs:
         with:
           path: state.json
           key: pm-state-${{ github.run_id }}
+      # keepalive: раз в неделю пустой коммит, чтобы расписание не отключилось через 60 дней
+      - name: Keepalive commit
+        if: github.event_name == 'schedule'
+        run: |
+          if [ "$(date +%u)" = "1" ] && [ "$(date +%H)" = "12" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git commit --allow-empty -m "keepalive: keep scheduled workflow active"
+            git push
+          else
+            echo "keepalive: не время (только Пн 12:xx UTC)"
+          fi
